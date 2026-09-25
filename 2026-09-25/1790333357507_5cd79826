@@ -1,0 +1,76 @@
+# 代码评审意见
+
+## 变更概述
+
+本次变更将 `writeLog` 方法中的 Git 日志仓库地址由 `log1` 修正为 `openai-code-review-log`，属于配置修正类改动，方向正确。
+
+但一行硬编码 URL 的修改，暴露出该方法在**配置管理、健壮性、资源管理**方面的多处隐患，建议一并处理。
+
+---
+
+## 评审意见
+
+### 1. 【重要】仓库 URI 硬编码，应外部化配置
+
+这正是本次变更的根因：仓库一旦改名、迁移或换人使用，就必须改源码、重新编译发版。`token` 已经通过方法参数传入，仓库地址同样应由调用方决定：
+
+```java
+private static String writeLog(String token, String repoUri, String log) throws Exception {
+    Git git = Git.cloneRepository()
+            .setURI(repoUri)
+            ...
+}
+```
+
+考虑到该 SDK 通常运行在 CI 环境（如 GitHub Actions），也可以直接读取环境变量：
+
+```java
+.setURI(System.getenv("LOG_REPO_URI"))
+```
+
+### 2. 【重要】`new File("repo")` 是魔法值且有冲突风险
+
+- 相对路径依赖进程工作目录，不同环境下行为不一致；
+- 若目录已存在且非空，`cloneRepository()` 会直接抛异常。
+
+建议使用带唯一标识的临时目录，并在流程结束后清理：
+
+```java
+File repoDir = Files.createTempDirectory("code-review-log").toFile();
+```
+
+### 3. 【重要】`Git` 对象疑似资源泄漏
+
+JGit 的 `Git` 实现了 `AutoCloseable`，clone 后的句柄应显式关闭，否则本地锁文件残留会导致下次 clone 失败：
+
+```java
+try (Git git = Git.cloneRepository()...call()) {
+    // write file, commit, push
+}
+```
+
+（diff 上下文未展示完整方法体，如已用 try-with-resources 请忽略。）
+
+### 4. 【建议】认证方式值得确认
+
+`new UsernamePasswordCredentialsProvider(token, "")` 将 token 作为用户名、密码留空。GitHub HTTPS 的标准做法是**任意用户名 + token 作为密码**（或用户名用 `oauth2`），建议实测确认当前写法在不同 token 类型（classic / fine-grained）下是否稳定。
+
+### 5. 【建议】异常声明过宽
+
+`throws Exception` 会把异常处理成本转嫁给调用方且无法精准捕获。建议收窄为 `GitAPIException`、`IOException`，或统一包装为自定义业务异常。
+
+### 6. 【建议】方法职责过重
+
+`writeLog` 一个私有方法承担了 **clone → 写文件 → commit → push** 全流程，建议拆分为独立步骤类（如 `LogRepository`），既便于单测 mock，也符合该 SDK 的中间件定位。
+
+---
+
+## 总结
+
+| 项目 | 结论 |
+|------|------|
+| 变更正确性 | ✅ 仓库地址修正合理 |
+| 主要风险 | ⚠️ 配置硬编码、目录冲突、资源泄漏 |
+| 建议动作 | 顺势将 URI/目录重构为外部配置，补齐资源关闭逻辑 |
+
+当前改动可以合入，但强烈建议在后续迭代中完成第 1、2、3 点重构，避免同类问题再次出现。
